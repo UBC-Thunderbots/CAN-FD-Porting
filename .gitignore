@@ -1,0 +1,7 @@
+Debug/
+Release/
+.settings/
+.metadata/
+*.elf
+*.bin
+*.hex
