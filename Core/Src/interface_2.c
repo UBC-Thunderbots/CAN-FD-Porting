@@ -4,12 +4,9 @@
  * @author  UBC Thunderbots
  * @brief   First attempt at the CAN port of the previous interface
  *
- * This module implements a protocol for controlling the motor over SPI.
- * The master can send commands to set the target speed or torque, configure
- * parameters, and select the type of telemetry response. The slave (this
- * firmware) processes the commands and responds with telemetry data.
- *
- * Message layout (10 bytes):
+* This version uses the STM32G4 FDCAN hardware RX/TX FIFOs and preserves
+ * the original command/telemetry encoding. Not hardware-tested. 
+ * Application message layout (10 bytes, carried in 12-byte CAN FD frame):
  *
  *  [0]    0xAA  delimiter byte 0
  *  [1]    0xBB  delimiter byte 1
@@ -32,6 +29,14 @@
 #include <stdbool.h>
 #include <string.h>
 
+/* CAN_COMMAND_ID and CAN_RESPONSE_ID must be defined in interface_2.h. */
+#ifndef CAN_COMMAND_ID
+#error "Define team-approved CAN_COMMAND_ID in interface_2.h"
+#endif
+#ifndef CAN_RESPONSE_ID
+#error "Define team-approved CAN_RESPONSE_ID in interface_2.h"
+#endif
+
 
 /* External variables --------------------------------------------------------*/
 
@@ -41,35 +46,17 @@ extern PID_Handle_t PIDSpeedHandle_M1;
 extern PID_Handle_t PIDIqHandle_M1;
 extern PID_Handle_t PIDIdHandle_M1;
 
-/* Protocol buffering -------------------------------------------------------*/
+/* Protocol format ---------------------------------------------------------*/
 
-//Deleted the streams
+#if MESSAGE_SIZE != 10U
+#error "This compatibility port requires the original 10-byte MESSAGE_SIZE"
+#endif
 
-
-
-static uint8_t tx_queue[TX_QUEUE_CAPACITY][MESSAGE_SIZE];
-static size_t tx_queue_head;
-static size_t tx_queue_tail;
-static size_t tx_queue_count;
+/* Diagnostics: TX submissions rejected and CAN transmissions completed. */
+volatile uint32_t unsent_msg_count = 0U;
+volatile uint32_t can_tx_count = 0U;
 
 /* Private variables ---------------------------------------------------------*/
-
-FDCAN_RxHeaderTypeDef RxHeader;
-uint8_t RxData[64];
-FDCAN_TxHeaderTypeDef TxHeader;
-uint8_t TxData[64];
-
-typedef struct
-{
-    uint32_t id;        // the CAN ID
-    uint8_t  length;    // Number of data bytes: 0-64
-    uint8_t  data[64];  // Payload
-
-    bool extended_id;   // false = 11-bit, true = 29-bit
-} CAN_Message;
-
-volatile bool txrx_half_completed;
-volatile bool txrx_completed;
 
 ResponseType_t response_type;
 
@@ -79,15 +66,9 @@ uint8_t last_seq_num;
 
 /* Private function prototypes -----------------------------------------------*/
 
-static void ResetProtocolBuffers(void);
-static void AppendRxBytes(const uint8_t *bytes, size_t length);
-static bool PopNextFrame(uint8_t *frame);
-static void QueueTxFrame(const uint8_t *frame);
-static bool DequeueTxFrame(uint8_t *frame);
 static void PopulateTxHeader(uint8_t *tx, uint8_t seq, ResponseType_t type);
 static void PopulateTx_ResponseForCurrentType(uint8_t *tx, uint8_t seq);
-static void ProcessSpiFrame(const uint8_t *rx);
-static void HandleCompletedDmaHalf(uint8_t half_index);
+
 
 void ProcessRx_SetTargetSpeed(const uint8_t *rx);
 void ProcessRx_SetTargetTorque(const uint8_t *rx);
@@ -109,32 +90,40 @@ void PopulateTx_ResponseSpeedAndSpeedRef(uint8_t *tx, uint8_t seq);
 void SetMotorEnabled(bool enabled);
 
 //New functions I implemented on 10/11-14
-static bool StoreUnsentMessage(const CAN_Message *message);
 static bool PopNextCanFrame(FDCAN_RxHeaderTypeDef *rxHeader, uint8_t *rxData);
 static void ProcessCANFrame(const uint8_t *rx);
 
 /* Function implementations --------------------------------------------------*/
 
 /**
- * Initializes the SPI interface module.
+ * Initializes the CAN interface module.
  */
 void Interface_Init(void)
 {
+  unsent_msg_count = 0U;
+  can_tx_count = 0U;
   response_type = SPEED_AND_FAULTS;
-
   motor_enabled = false;
-
   last_seq_num = 0;
 }
 
+
 /**
- * Main loop for the SPI interface module.
- * Continuously waits for SPI transactions to complete and processes them.
+ * Main loop for the CAN interface module (polling RX FIFOs).
  */
 void Interface_Loop(void)
 {
   FDCAN_RxHeaderTypeDef rx_header;
   uint8_t rx_data[64];
+
+  if (HAL_FDCAN_ActivateNotification(&hfdcan1,
+                                   FDCAN_IT_TX_COMPLETE,
+                                   FDCAN_TX_BUFFER0 |
+                                   FDCAN_TX_BUFFER1 |
+                                   FDCAN_TX_BUFFER2) != HAL_OK)
+  {
+    return;
+  }
 
   if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
   {
@@ -143,12 +132,7 @@ void Interface_Loop(void)
 
   while (1)
   {
-    if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0U)
-    {
-      continue;
-    }
-
-    if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK)
+    if (!PopNextCanFrame(&rx_header, rx_data))
     {
       continue;
     }
@@ -165,108 +149,30 @@ void Interface_Loop(void)
     ProcessCANFrame(rx_data);
   }
 }
-/**
- * Resets the protocol stream and response queue.
- */
-static void ResetProtocolBuffers(void)
-{
-  memset(rx_stream, 0, sizeof(rx_stream));
-  rx_stream_length = 0;
-
-  memset(tx_queue, 0, sizeof(tx_queue));
-  tx_queue_head = 0;
-  tx_queue_tail = 0;
-  tx_queue_count = 0;
-}
 
 /**
- * Appends the given bytes to the sliding receive window.
+ * Retrieves one complete frame from the configured FDCAN RX FIFOs.
  */
-static void AppendRxBytes(const uint8_t *bytes, size_t length)
-{
-  if (length > RX_STREAM_CAPACITY)
-  {
-    bytes += length - RX_STREAM_CAPACITY;
-    length = RX_STREAM_CAPACITY;
-  }
-
-  if (rx_stream_length + length > RX_STREAM_CAPACITY)
-  {
-    const size_t bytes_to_discard = rx_stream_length + length - RX_STREAM_CAPACITY;
-    memmove(rx_stream, rx_stream + bytes_to_discard, rx_stream_length - bytes_to_discard);
-    rx_stream_length -= bytes_to_discard;
-  }
-
-  memcpy(rx_stream + rx_stream_length, bytes, length);
-  rx_stream_length += length;
-}
-
-/**
- * Extracts the next valid SPI frame from the sliding receive window.
- */
-
 static bool PopNextCanFrame(FDCAN_RxHeaderTypeDef *rxHeader, uint8_t *rxData)
 {
-   uint32_t RX_FIFO_to_use = 0U;
+  uint32_t RX_FIFO_to_use;
 
-    // Check if any CAN frames are available on FIFO 0
-    if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U)
-    {
-     RX_FIFO_to_use = FDCAN_RX_FIFO0;
-    }
-
-    //Check if any CAN frames are available on FIFO 1
-    else if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO1) >= CAN_MESSAGE_SIZE)
-    {
-     RX_FIFO_to_use = FDCAN_RX_FIFO1;
-    }
-    else
-    {
-    	return false;
-    }
-
-
-    // Fetch the next complete CAN frame
-    if (HAL_FDCAN_GetRxMessage(&hfdcan1, RX_FIFO_to_use, rxHeader, rxData) != HAL_OK)
-    {
-        return false;
-    }
-
-    return true;
-}
-/**
- * Stores a response frame so it can be loaded into the next available TX DMA half.
- */
-static void QueueTxFrame(const uint8_t *frame)
-{
-  memcpy(tx_queue[tx_queue_head], frame, MESSAGE_SIZE);
-  tx_queue_head = (tx_queue_head + 1U) % TX_QUEUE_CAPACITY;
-
-  if (tx_queue_count == TX_QUEUE_CAPACITY)
+  if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U)
   {
-    tx_queue_tail = (tx_queue_tail + 1U) % TX_QUEUE_CAPACITY;
+    RX_FIFO_to_use = FDCAN_RX_FIFO0;
+  }
+  else if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO1) > 0U)
+  {
+    RX_FIFO_to_use = FDCAN_RX_FIFO1;
   }
   else
-  {
-    tx_queue_count++;
-  }
-}
-
-/**
- * Retrieves the oldest queued response frame.
- */
-static bool DequeueTxFrame(uint8_t *frame)
-{
-  if (tx_queue_count == 0U)
   {
     return false;
   }
 
-  memcpy(frame, tx_queue[tx_queue_tail], MESSAGE_SIZE);
-  tx_queue_tail = (tx_queue_tail + 1U) % TX_QUEUE_CAPACITY;
-  tx_queue_count--;
-  return true;
+  return HAL_FDCAN_GetRxMessage(&hfdcan1, RX_FIFO_to_use, rxHeader, rxData) == HAL_OK;
 }
+
 
 /**
  * Populates the common prefix for a transmit frame.
@@ -287,8 +193,8 @@ static void PopulateTxHeader(uint8_t *tx, uint8_t seq, ResponseType_t type)
 static void PopulateTx_ResponseForCurrentType(uint8_t *tx, uint8_t seq)
 {
 
-  //In this function is where can ID would be implemented best
-  switch (response_type)
+  /* Response type selects telemetry contents; CAN ID is in txHeader. */
+  switch (response_type) 
   {
     case SPEED_AND_FAULTS:
       PopulateTx_ResponseSpeedAndFaults(tx, seq);
@@ -315,14 +221,20 @@ static void PopulateTx_ResponseForCurrentType(uint8_t *tx, uint8_t seq)
 }
 
 /**
- * Processes a complete SPI frame by executing the received command and queuing
- * the matching response frame.
+ * Processes a CAN FD payload containing the original 10-byte command.
+ * Generates and submits matching telemetry via the hardware TX FIFO.
  */
 static void ProcessCANFrame(const uint8_t *rx)
 {
-  //Removed the delimiter part since CAN contains ID at first bit always
+ 
+  if (rx[0] != MESSAGE_DELIMITER_0 ||
+      rx[1] != MESSAGE_DELIMITER_1 ||
+      rx[2] != MESSAGE_DELIMITER_2 ||
+      rx[9] != CrcGenerateChecksum(rx, MESSAGE_SIZE - 1))
+  {
+    return;
+  }
 
-  /* Validate sequence number; accept current seq num (resent message) or next seq num */
   const uint8_t seq = rx[3];
   const uint8_t expected_same = last_seq_num;
   const uint8_t expected_next = (uint8_t)(last_seq_num + 1U);
@@ -330,62 +242,58 @@ static void ProcessCANFrame(const uint8_t *rx)
   {
     return;
   }
-  last_seq_num = seq;
 
   switch ((Opcode_t)rx[4])
   {
-    case NO_OP:
-      break;
-    case SET_TARGET_SPEED:
-      ProcessRx_SetTargetSpeed(rx);
-      break;
-    case SET_TARGET_TORQUE:
-      ProcessRx_SetTargetTorque(rx);
-      break;
-    case SET_RESPONSE_TYPE:
-      ProcessRx_SetResponseType(rx);
-      break;
-    case SET_PID_TORQUE_KP_KI:
-      ProcessRx_SetPidTorqueKpKi(rx);
-      break;
-    case SET_PID_FLUX_KP_KI:
-      ProcessRx_SetPidFluxKpKi(rx);
-      break;
-    case SET_PID_SPEED_KP_KI:
-      ProcessRx_SetPidSpeedKpKi(rx);
-      break;
-    case SET_SPEED_FEED_FORWARD_KA_KV:
-      ProcessRx_SetSpeedFeedForwardKaKv(rx);
-      break;
-    case SET_SPEED_FEED_FORWARD_KS:
-      ProcessRx_SetSpeedFeedForwardKs(rx);
-      break;
+    case NO_OP: break;
+    case SET_TARGET_SPEED: ProcessRx_SetTargetSpeed(rx); break;
+    case SET_TARGET_TORQUE: ProcessRx_SetTargetTorque(rx); break;
+    case SET_RESPONSE_TYPE: ProcessRx_SetResponseType(rx); break;
+    case SET_PID_TORQUE_KP_KI: ProcessRx_SetPidTorqueKpKi(rx); break;
+    case SET_PID_FLUX_KP_KI: ProcessRx_SetPidFluxKpKi(rx); break;
+    case SET_PID_SPEED_KP_KI: ProcessRx_SetPidSpeedKpKi(rx); break;
+    case SET_SPEED_FEED_FORWARD_KA_KV: ProcessRx_SetSpeedFeedForwardKaKv(rx); break;
+    case SET_SPEED_FEED_FORWARD_KS: ProcessRx_SetSpeedFeedForwardKs(rx); break;
+    default: return;
   }
+  last_seq_num = seq;
 
-  uint8_t tx[MESSAGE_SIZE];
-  PopulateTx_ResponseForCurrentType(tx, seq);
-  HAL_FDCAN_AddMessageToTxFifoQ( &hfdcan1, &TxHeader, TxData); //Changed this for the OLD Spi QueueTx function
-}
+  uint8_t tx[12] = {0};
 
-/**
- * Handles one completed DMA half-buffer by parsing any valid frames found in
- * the incoming byte stream and loading the next TX frame into the completed half.
- */
-static void HandleCompletedDmaHalf(uint8_t half_index)
+PopulateTx_ResponseForCurrentType(tx, seq);
+
+FDCAN_TxHeaderTypeDef txHeader = {0};
+
+// The header holds CAN arbitration/format metadata; tx holds telemetry data.
+
+  txHeader.Identifier = CAN_RESPONSE_ID;
+  txHeader.IdType = FDCAN_STANDARD_ID;
+  txHeader.TxFrameType = FDCAN_DATA_FRAME;
+  txHeader.DataLength = FDCAN_DLC_BYTES_12;
+  txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  txHeader.BitRateSwitch = FDCAN_BRS_ON;
+  txHeader.FDFormat = FDCAN_FD_CAN;
+  txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  txHeader.MessageMarker = 0U;
+
+
+ //Checking wether there's space in the queue before sending message 
+if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) > 0U)
 {
-  AppendRxBytes(rx_bufs[half_index], CAN_MESSAGE_SIZE);
-
-  uint8_t frame[CAN_MESSAGE_SIZE];
-  while (PopNextFrame(frame))
-  {
-    ProcessSpiFrame(frame);
-  }
-
-  if (!DequeueTxFrame(tx_bufs[half_index]))
-  {
-    PopulateTx_ResponseForCurrentType(tx_bufs[half_index], 0);
-  }
+    if (HAL_FDCAN_AddMessageToTxFifoQ( &hfdcan1, &txHeader, tx) != HAL_OK)
+    {
+        unsent_msg_count++;
+    }
 }
+else
+{
+    unsent_msg_count++;
+}
+}
+
+
+
+
 
 /**
  * Processes the received SPI frame to update the target speed for
@@ -690,67 +598,19 @@ void SetMotorEnabled(bool enabled)
   }
   motor_enabled = enabled;
 }
-
-/*CAN_FD edge cases handler */
-
-
-static bool StoreUnsentMessage(const CAN_Message *message)
+/* Count successful CAN transmissions, not just TX FIFO submissions.
+ * Requires the FDCAN TX-complete interrupt routed through HAL_FDCAN_IRQHandler().
+ */
+void HAL_FDCAN_TxBufferCompleteCallback(FDCAN_HandleTypeDef *hfdcan,
+                                        uint32_t BufferIndexes)
 {
-	 //Stores message in the previous software queue we had implemented and waits for it to transmit
-		 //OR we could use one of the FIFO's if it isn't used
-    if (message == NULL || message->length != CAN_MESSAGE_SIZE)
-    {
-        return false;
-    }
-
-    // Don't overwrite old messages
-    if (tx_queue_count >= TX_QUEUE_CAPACITY)
-    {
-        return false;
-    }
-
-    // Copy the complete CAN message into the queue
-    tx_queue[tx_queue_head] = *message;
-
-    // Advance head, wrapping around when needed
-    tx_queue_head = (tx_queue_head + 1U) % TX_QUEUE_CAPACITY;
-
-    tx_queue_count++;
-
-    return true;
-}
-
- }
-
-
-
-
-
-
-
-/* SPI callback handlers -----------------------------------------------------
-
-void HAL_SPI_TxRxHalfCpltCallback(SPI_HandleTypeDef* hspi)
-{
-  if (hspi->Instance == SPI1)
+  if (hfdcan->Instance == FDCAN1)
   {
-    txrx_half_completed = true;
+    if ((BufferIndexes & FDCAN_TX_BUFFER0) != 0U) can_tx_count++;
+    if ((BufferIndexes & FDCAN_TX_BUFFER1) != 0U) can_tx_count++;
+    if ((BufferIndexes & FDCAN_TX_BUFFER2) != 0U) can_tx_count++;
   }
 }
 
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef* hspi)
-{
-  if (hspi->Instance == SPI1)
-  {
-    txrx_completed = true;
-  }
-}
 
-void HAL_SPI_ErrorCallback(SPI_HandleTypeDef* hspi)
-{
-  if (hspi->Instance == SPI1)
-  {
-    // Do nothing for now
-  }
-}
-*/
+ 
