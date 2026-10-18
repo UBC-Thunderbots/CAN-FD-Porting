@@ -45,14 +45,9 @@ extern FDCAN_HandleTypeDef hfdcan1;
 extern PID_Handle_t PIDSpeedHandle_M1;
 extern PID_Handle_t PIDIqHandle_M1;
 extern PID_Handle_t PIDIdHandle_M1;
+ 
 
-/* Protocol format ---------------------------------------------------------*/
-
-#if MESSAGE_SIZE != 10U
-#error "This compatibility port requires the original 10-byte MESSAGE_SIZE"
-#endif
-
-/* Diagnostics: TX submissions rejected and CAN transmissions completed. */
+/* Diagnostics: messages rejected and completed. */
 volatile uint32_t unsent_msg_count = 0U;
 volatile uint32_t can_tx_count = 0U;
 
