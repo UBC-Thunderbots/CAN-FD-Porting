@@ -19,7 +19,8 @@ Additionally, the previous software TX queue and dequeue functions were removed.
 ### 1.1 Main Architectural Differences Between SPI and CAN FD
 
 <img width="282" height="505" alt="SPI_Flowchart" src="https://github.com/user-attachments/assets/8ef3dca2-fe0c-42b0-bad1-c4f691fd7df2" />
-<img width="350" height="581" alt="CAN_Flowchart" src="https://github.com/user-attachments/assets/4b47ceba-2b21-4d07-a205-3faed2d4abc5" />
+<img width="350" height="567" alt="CAN_Flowchart" src="https://github.com/user-attachments/assets/b6faf792-514a-4234-9f88-583ef0167570" />
+
 
 
 
